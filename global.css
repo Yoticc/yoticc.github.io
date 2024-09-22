@@ -14,16 +14,6 @@ body {
   width: 100%;
 }
 
-/*
-html {
-    padding-top: 10%;
-    display: table;
-    margin: auto;
+.noselect {
+    user-select: none;
 }
-
-body {
-    background-color: #2F2F2F;
-    display: table-cell;
-    vertical-align: middle;
-}
-*/
