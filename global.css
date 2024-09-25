@@ -3,17 +3,19 @@ html, body {
 }
 
 body {
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
     background-color: #1E1E1E;
 }
 
 .center {
-  display: block;
-  margin-left: auto;
-  margin-right: auto;
-  width: 100%;
+    object-fit: none;
 }
 
 .noselect {
     user-select: none;
+}
+
+.select {
+    user-select: all;
 }
