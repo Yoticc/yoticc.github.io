@@ -1,11 +1,13 @@
-html, body {    
-    margin: auto;
-}
-
 body {
+    margin: auto;
     overflow-y: auto;
     overflow-x: hidden;
     background-color: #1E1E1E;
+    position: absolute;
+    left: 50%;
+    transform: translate(-50%, 0); 
+    object-fit: none;
+    user-select: none; 
 }
 
 .center {
