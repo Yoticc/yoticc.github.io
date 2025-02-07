@@ -1,0 +1,501 @@
+// uses bbcodes from unknowncheats.me
+
+Over the past weeks, I've been trying a lot to find the best way to inject C# code into process.
+In this thread, I have collected consistently my decisions and their pros and cons.
+Briefly, the methods themselves:
+1. CLRHost
+2. Hostfxr C++
+3. Hostfxr C#
+4. NativeAOT with DllMain
+5. NativeAOT with wrapper
+
+1. [B]CLRHost[/B]
+[B][-][/B] Works only with .netframework (2.0, 4.0 and the newest)
+[B][-][/B] Need C++ Wrapper
+[B][-][/B] Big aim for AC
+I lost the source code, except for one snippet.
+Here is a similar thread I just found [url="https://www.unknowncheats.me/forum/general-programming-and-reversing/332825-inject-net-dll-using-clr-hosting.html"]How to inject .NET DLL using CLR Hosting[/url]
+But I'll add my own, better method
+[CODE]
+int execNetLib(LPCWSTR path, LPCWSTR classFullName, LPCWSTR methodName, LPCWSTR args)
+{
+ ICLRMetaHost* metaHost = NULL;
+ IEnumUnknown* runtime = NULL;
+ ICLRRuntimeInfo* runtimeInfo = NULL;
+ ICLRRuntimeHost* runtimeHost = NULL;
+ IUnknown* enumRuntime = NULL;
+ LPWSTR frameworkName = NULL;
+ DWORD bytes = 2048, result = 0;
+ HRESULT hr;
+  
+ if (CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&metaHost) != S_OK) {
+  logln("[x] Error: CLRCreateInstance(..)");
+  return -1;
+ }
+
+ if (metaHost->EnumerateInstalledRuntimes(&runtime) != S_OK) {
+  logln("[x] Error: EnumerateInstalledRuntimes(..)");
+  return -1;
+ }
+
+ frameworkName = (LPWSTR)LocalAlloc(LPTR, 2048);
+ if (frameworkName == NULL) {
+  logln("[x] Error: malloc could not allocate");
+  return -1;
+ }
+
+ while (runtime->Next(1, &enumRuntime, 0) == S_OK) {
+  if (enumRuntime->QueryInterface<ICLRRuntimeInfo>(&runtimeInfo) == S_OK) {
+   if (runtimeInfo != NULL) {
+    runtimeInfo->GetVersionString(frameworkName, &bytes);
+    logln("[*] Supported Framework: ");
+    logln((string)CW2A(frameworkName));
+   }
+  }
+ }
+
+ if (runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost, (LPVOID*)&runtimeHost) != S_OK) {
+  logln("[x] ..GetInterface(CLSID_CLRRuntimeHost...) failed");
+  return -1;
+ }
+
+ if (runtimeHost == NULL || bytes == 0) {
+  logln("[*] Using runtime:");
+  logln((string)CW2A(frameworkName));
+ }
+ runtimeHost->Start();
+ if (runtimeHost->ExecuteInDefaultAppDomain(path, classFullName, methodName, args, &result) != S_OK) {
+  logln("[x] Error: ExecuteInDefaultAppDomain(..) failed\n");
+  return -1;
+ }
+ else return 0;
+
+ return -1;
+}
+[/CODE]
+[B]NOTE[/B]: Don't forget to run this code on a different thread, as the thread from which the dll is initially run is very toxic and may prevent the CLR from starting.
+
+
+2. [B]Hostfxr C++[/B]
+[B][-][/B] Need C++ Wrapper
+[B][-][/B] Need to inject 2 libraries (extra lib and C++ wrapper)
+[B][-][/B] Big aim for AC
+Official tutorial: [url]https://learn.microsoft.com/en-us/dotnet/core/tutorials/netcore-hosting[/url]
+Official sample: [url]https://github.com/dotnet/samples/tree/main/core/hosting[/url]
+
+I Create C++ DynamicLibrary project
+II Do shit in the project settings (include, etc.)
+III Import nethost.lib and nethost.dll into project ([url]https://drive.google.com/drive/folders/16j1P3ma457NR6oN5zeVWKGUqgCwtH5dS?usp=sharing[/url]. I don't remember where I downloaded them from.)
+IV Import headers from:
+[url]https://github.com/dotnet/runtime/blob/main/src/native/corehost/coreclr_delegates.h[/url]
+[url]https://github.com/dotnet/runtime/blob/main/src/native/corehost/hostfxr.h[/url]
+[url]https://github.com/dotnet/runtime/blob/main/src/coreclr/hosts/inc/coreclrhost.h[/url]
+V Paste code in DllMain
+[CODE]
+#include "pch.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <nethost.h>
+#include <coreclr_delegates.h>
+#include <hostfxr.h>
+#include <Windows.h>
+using namespace std;
+#define STR(s) L ## s
+#define CH(c) L ## c
+#define DIR_SEPARATOR L'\\'
+
+using string_t = std::basic_string<char_t>;
+
+namespace
+{
+    hostfxr_initialize_for_runtime_config_fn init_fptr;
+    hostfxr_get_runtime_delegate_fn get_delegate_fptr;
+    hostfxr_close_fn close_fptr;
+    bool load_hostfxr();
+    load_assembly_and_get_function_pointer_fn get_dotnet_load_assembly(const char_t* assembly);
+}
+
+void exec()
+{
+    if (!load_hostfxr())
+    {
+        assert(false && "Failure: load_hostfxr()");
+    }
+
+    const string_t root = STR("C:\\Inject\\");
+    const string_t cfg = STR("dn.cfg.json");
+    const string_t lib = STR("CSDll.dll");   
+
+    const string_t cfg_path = root + cfg;
+    const string_t lib_path = root + lib;
+
+    const char_t* dotnet_type = STR("CSDll.EntryPoint, CSDll");
+    const char_t* dotnet_type_method = STR("Main");
+
+    load_assembly_and_get_function_pointer_fn load_assembly_and_get_function_pointer = nullptr;
+    load_assembly_and_get_function_pointer = get_dotnet_load_assembly(cfg_path.c_str());
+    assert(load_assembly_and_get_function_pointer != nullptr && "Failure: get_dotnet_load_assembly()");
+    component_entry_point_fn main = nullptr;
+    int rc = load_assembly_and_get_function_pointer(
+        lib_path.c_str(),
+        dotnet_type,
+        dotnet_type_method,
+        nullptr,
+        nullptr,
+        (void**)&main);
+    assert(rc == 0 && main != nullptr && "Failure: load_assembly_and_get_function_pointer()");
+
+    struct lib_args
+    {
+        const char_t* message;
+    };
+    lib_args args
+    {
+        STR("")
+    };
+
+    main(&args, sizeof(args));
+}
+
+void load()
+{
+	try {
+		exec();
+	}
+	catch (exception ex) {
+		//Some logging
+	}
+}
+
+void unload()
+{
+	
+}
+
+bool loaded = false, unloaded = false;
+BOOL __stdcall DllMain(HINSTANCE handle, DWORD reason, LPVOID reserved)
+{
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+		if (loaded)
+			return TRUE;
+		loaded = true;
+
+		Beep(500, 500);
+		CreateThread(NULL, NULL, (LPTHREAD_START_ROUTINE)load, NULL, NULL, NULL);
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+		if (unloaded || !loaded)
+			return TRUE;
+		unloaded = true;
+
+        unload();
+        break;
+    }
+    return TRUE;
+}
+
+namespace
+{
+    void* load_library(const char_t*);
+    void* get_export(void*, const char*);
+
+    void* load_library(const char_t* path)
+    {
+        HMODULE h = ::LoadLibraryW(path);
+        assert(h != nullptr);
+        return (void*)h;
+    }
+    void* get_export(void* h, const char* name)
+    {
+        void* f = ::GetProcAddress((HMODULE)h, name);
+        assert(f != nullptr);
+        return f;
+    }
+
+    bool load_hostfxr()
+    {
+        char_t buffer[MAX_PATH];
+        size_t buffer_size = sizeof(buffer) / sizeof(char_t);
+        int rc = get_hostfxr_path(buffer, &buffer_size, nullptr);
+        if (rc != 0)
+            return false;
+        void* lib = load_library(buffer);
+        init_fptr = (hostfxr_initialize_for_runtime_config_fn)get_export(lib, "hostfxr_initialize_for_runtime_config");
+        get_delegate_fptr = (hostfxr_get_runtime_delegate_fn)get_export(lib, "hostfxr_get_runtime_delegate");
+        close_fptr = (hostfxr_close_fn)get_export(lib, "hostfxr_close");
+
+        return (init_fptr && get_delegate_fptr && close_fptr);
+    }
+
+    load_assembly_and_get_function_pointer_fn get_dotnet_load_assembly(const char_t* config_path)
+    {
+        void* load_assembly_and_get_function_pointer = nullptr;
+        hostfxr_handle cxt = nullptr;
+        int rc = init_fptr(config_path, nullptr, &cxt);
+        if (rc != 0 || cxt == nullptr)
+        {
+            std::cerr << "Init failed: " << std::hex << std::showbase << rc << std::endl;
+            close_fptr(cxt);
+            return nullptr;
+        }
+        rc = get_delegate_fptr(
+            cxt,
+            hdt_load_assembly_and_get_function_pointer,
+            &load_assembly_and_get_function_pointer);
+        if (rc != 0 || load_assembly_and_get_function_pointer == nullptr)
+            std::cerr << "Get delegate failed: " << std::hex << std::showbase << rc << std::endl;
+
+        close_fptr(cxt);
+        return (load_assembly_and_get_function_pointer_fn)load_assembly_and_get_function_pointer;
+    }
+}
+[/CODE]
+In my case I need to store files in C:\\Inject, you can change path and file namings in code.
+VI Create Net 6.0 Lybrary-project
+VII Paste the code in EntryPoint.cs
+[CODE]
+namespace CSDll;
+public class EntryPoint
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Args
+    {
+        public IntPtr arg;
+    }
+
+    private static bool inited;
+    public static int Main(IntPtr argsPtr, int argsLength)
+    {
+        if (inited)
+            return -2;
+        inited = true;
+
+        Args args = Marshal.PtrToStructure<Args>(argsPtr);
+        Console.Beep(3000, 500);
+
+        try
+        {
+            Program.Main(Marshal.PtrToStringAuto(args.arg));
+        }
+        catch (Exception ex)
+        {
+            MessageBox(IntPtr.Zero, ex.ToString(), "C# Exception", 0);
+        }
+
+        return 0;
+    }
+}
+[/CODE]
+VIII Paste the code in Program.cs
+[CODE]
+namespace CSDll;
+
+public unsafe class Program
+{   
+    public static void Main(string args)
+    {
+        //Your code
+
+        Thread.Sleep(int.MaxValue);
+    }
+}
+[/CODE]
+IIX Create Folder "C:\\Inject"
+IX Create file dn.cfg.json and write your dll config into it, if it is not there, then you need to get it from a project with a similar framework. In my case I am using Net6.0 and for me it looks like this:
+[CODE]
+{
+  "runtimeOptions": {
+    "tfm": "net6.0",
+    "frameworks": [
+      {
+        "name": "Microsoft.NETCore.App",
+        "version": "6.0.0"
+      },
+      {
+        "name": "Microsoft.WindowsDesktop.App",
+        "version": "6.0.0"
+      }
+    ]
+  }
+}
+[/CODE]
+
+
+3. [B]Hostfxr C#[/B] (Added by Measuring)
+[B][-][/B] Need C# Injector
+[B][-][/B] Need to inject 2 libraries (extra lib and C++ wrapper)
+[B][-][/B] Big aim for AC
+
+You can use a ready-made library that uses RemoteProcess, without C++ and the need to inject a wrapper.
+Library github - [url]https://github.com/DetourSharp/DetourSharp.Hosting[/url]
+Example:
+[CODE]using System.Diagnostics;
+using System.Runtime.InteropServices;
+using DetourSharp.Hosting;
+
+var process = Process.Start(@"C:\Windows\System32\notepad.exe");
+process.WaitForInputIdle();
+
+using var runtime = new RemoteRuntime(process.Id);
+var config = $"{typeof(Program).Assembly.GetName().Name}.runtimeconfig.json";
+runtime.Initialize(Path.Combine(AppContext.BaseDirectory, config));
+
+runtime.Invoke(((Delegate)ShowMessageBox).Method, ("Hello, world!", "Success"));
+
+static void ShowMessageBox((string Message, string Caption) parameters)
+{
+    _ = MessageBoxW(IntPtr.Zero, parameters.Message, parameters.Caption, 0);
+
+    [DllImport("user32", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    static extern int MessageBoxW(IntPtr hWnd, string text, string caption, uint type);
+}[/CODE]
+
+
+4. [B]NativeAOT with DllMain[/B]
+[B][-][/B] Works only on .Net 7
+[B][-][/B] Not injected through many injectors (only the hacker process works for me)
+[B]DO NOT USE THIS METHOD, IT HAS A CRITICAL BUG, USE .4 POINT[/B]
+I Create .Net7 Library Project
+II Past it in YourProject.csproj
+[CODE]
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+	<ImplicitUsings>enable</ImplicitUsings>
+	<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+	<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	<IncludeSymbolsInSingleFile>true</IncludeSymbolsInSingleFile>
+	<PublishAot>true</PublishAot>
+	<StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+</Project>
+[/CODE]
+III Past code in Program
+[CODE]
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+public class Program
+{
+    static void Main() { }
+
+    private const uint DLL_PROCESS_DETACH = 0;
+    private const uint DLL_PROCESS_ATTACH = 1;
+    private const uint DLL_THREAD_ATTACH = 2;
+    private const uint DLL_THREAD_DETACH = 3;
+
+    [UnmanagedCallersOnly(EntryPoint = "DllMain", CallConvs = new Type[] { typeof(CallConvStdcall) })]
+    public static bool DllMain(IntPtr module, uint reason, IntPtr reserved)
+    {
+        switch (reason)
+        {
+            case DLL_PROCESS_DETACH:
+                Unload();
+                break;
+            case DLL_PROCESS_ATTACH:
+                Load();
+                break;
+            case DLL_THREAD_ATTACH: break;
+            case DLL_THREAD_DETACH: break;
+        }
+        return true;
+    }
+
+    public static void Load()
+    {
+        File.WriteAllText(@"C:\log.txt", "It works!");
+    }
+
+    public static void Unload() { }
+}
+[/CODE]
+IV Build using publishing.
+IV.1 Open Developer Powershell
+IV.2 Exec "dotnet publish -r win-x64 -c Release"
+Your dll will be in "bin\Release\net7.0\win-x64\native"
+Inject using the ProcessHacker (LoadLibrary) or GH Injector by miltikill 3.4.0+ any methods (also mmap <3), other injectors don't work
+
+5. [B]NativeAOT with wrapper[/B]
+[B][-][/B] Need C++ Wrapper
+[B][-][/B] Need extra builder or to inject 2 dlls
+I, II Repeate 3.I, 3.II
+III Past code in new class EntryPoint
+[CODE]
+[UnmanagedCallersOnly(EntryPoint = "Load", CallConvs = new System.Type[] { typeof(CallConvCdecl) })]
+public static void Load()
+{
+    
+}
+
+[UnmanagedCallersOnly(EntryPoint = "Unload", CallConvs = new System.Type[] { typeof(CallConvCdecl) })]
+public static void Unload()
+{
+    
+}
+[/CODE]
+IV. Create C++ Dynamic Library Project with name "Wrapper"
+V. Past code in DllMain.cpp
+[CODE]
+#include <Windows.h>
+
+BOOL __stdcall DllMain(HINSTANCE handle, DWORD reason, LPVOID reserved)
+{
+	switch (reason)
+	{
+		case DLL_PROCESS_ATTACH:
+		{
+			HMODULE module = GetModuleHandleW(L"Cheat");
+			void* loadFuncPtr = GetProcAddress(module, "Load");
+			((void(*)(void))loadFuncPtr)();
+		}
+		case DLL_PROCESS_DETACH:
+		{
+			HMODULE module = GetModuleHandleW(L"Cheat");
+			void* unloadFuncPtr = GetProcAddress(module, "Unload");
+			((void(*)(void))unloadFuncPtr)();
+		}
+		break;
+	}
+	return TRUE;
+}
+[/CODE]
+If you don't want to inject two dlls - you can make library loading of your main dll in wrapper.
+My code working code, looks bad
+[CODE]
+case DLL_PROCESS_ATTACH:
+{
+	HMODULE module = GetModuleHandleW(L"Cheat");
+	if (module == 0)
+	{
+		HMODULE baseModule = GetModuleHandleW(L"Wrapper");
+		TCHAR filenameBuff[MAX_PATH];
+		GetModuleFileNameW(baseModule, filenameBuff, _countof(filenameBuff));
+		wstring filenameTemp(&filenameBuff[0]);
+		string filename(filenameTemp.begin(), filenameTemp.end());
+
+		string directory = ((string)filename).substr(0, ((string)filename).find_last_of("/\\"));			
+
+		string cheatPath = directory.append("\\Cheat.dll");
+		module = LoadLibraryW(wstring(cheatPath .begin(), cheatPath .end()).c_str());
+	}
+
+	void* loadFuncPtr = GetProcAddress(module, "Load");
+	((void(*)(void))loadFuncPtr)();
+}
+[/CODE]
+
+And change "Cheat" to your module name (usually - your dll name)
+For inject you need:
+1. Inject your dll(Cheat)
+2. Inject wrapper dll
+
+If you have any suggestions or problems - write here

@@ -1,0 +1,506 @@
+# About rendering in Minecraft. Creating ESP for Minecraft ALL versions
+
+I started to write a comment to the post by [url="https://www.unknowncheats.me/forum/minecraft/646682-hooking-opengl-methods-esp.html"]ScatoBoy[/url] and realized that it was too big for a usual comment. So I decided to expand this topic and put it in a separate post. 
+
+This post will be:
+1. About how OpenGL works for TEAPOTS AND DUKE'S MICROWAVES
+2. About the rendering system in versions 1.0.0-1.14.4, 1.15-1.16.5, 1.17-1.21 and newer versions
+3. How to create ESP based on this information
+4. About a software that not many people know about, designed for easy render API debugging
+
+In this post I will talk about rendering using Minecraft 1.12.2 as an example.
+How to use Nsight Graphics to reverse engineer and create ESP for 1.15 and 1.17 you can read in the second part - (Introduction to Nsight Graphics. Creating ESP for Minecraft 1.15-1.21)[]
+
+All the code shown here is pseudocode and is not part of any programming language.
+## First about Minecraft
+
+Minecraft uses LWJGL for window management and rendering. 
+LWJGL is a common binding for OpenGL, so only that you should just know that Minecraft communicates with the graphics api - OpenGL, via LWGJL. This means that in the case of creating a cheat. It will be possible to hook calls to both OpenGL and LWGJL library functions.
+
+As in all fps games, the rendering is done cyclically, the number of cycles per second is known as FPS. Each cycle follows almost the same steps, which always follow each other.
+
+Here's an example of render stages:
+3D:
+1. Skybox
+2. Solid blocks
+3. Not solid blocks, 2d texture blocks
+4. Entity, also some tile blocks. This phase has very many sub phases, armor rendering, shadows, nametags, enchantments etc
+5. Particles
+6. Hands, 3d-overlay
+2D:
+7. Hotbar, Bossbar, Health, Satiation, Armor etc. Also has many sub phases.
+8. Other Gui, like Chat, Server Bar, Potions etc
+
+The entire render cycle takes place in two coordinate systems:
+1. Rendering with perspective in 3 dimensions cartesian coordinate system, the player is the camera for the scene
+2. Render in 2 dimensions cartesian coordinate system, start of canvas is top-left corner of the window
+
+Rendering of different parts is achieved by different techniques, are different on each version, but on some versions they are very similar:
+1. 1.0.0 - 1.14.4 — Simple rendering. Much use of matrix, unlike other versions
+ 2. 1.15 - 1.16.5 — Switched to using more glDrawArrays and less using Matrixes
+ 3. 1.17 - 1.21.1 — Started of using shaders for rendering. Switched from glDrawArrays to glDrawElements
+ 
+But here we are interested in the rendering part related to tile blocks and entities. 
+Their rendering is similar between the two. This is a rendering of the model.
+The model consists of polygons. But let's slow down a bit and talk about OpenGL.
+
+### About OpenGL
+
+You need to understand GPU. Transferring data from CPU to GPU. That GPU is good at vector computing and why it's better to move light but large computations to GPU etc. I hope you have some knowledge about this. Otherwise it will be difficult to understand. 
+
+If you know what Modelview, Projection and Matrix transformation are, you won't need this information, but if you don't know, then let's imagine it as simple as possible:
+
+There are two sides, the CPU and the GPU:
+1. The CPU works with system calls (the file system, windows, inputs), communicates quickly with RAM.
+2. The GPU cannot communicate with the system, but it has its own memory called VRAM. It can only, simplistically, work according to a simple algorithm: Move data from RAM to VRAM. Process data from VRAM. Moving data from VRAM to RAM, doesn't sound that simple. In fact it is, moving data back and forth is a labor-intensive operation
+
+Here's a simple [url="https://youtu.be/Axd50ew4pco?si=eVY4dq3wDWGqAVzM"]video[/url] about it. It has some unnecessary information, but it is much more effective in explaining the difference between CPU and GPU than texts can do here.
+Why would you do that? To understand that it's easier to move all the computations from the CPU to the GPU. Understanding this will make the whole concept easier to grasp.
+
+For the sake of understanding, let's visualize the rendering like this:
+
+[WARNING]IT'S JUST AN EXAMPLE, THERE'S REALLY NO SCENE, CAMERA, ETC IN RENDERING. JUST DULL MATH, S.O.S.U.N.O.K. [/WARNING]
+
+The world as one big 3d scene
+The camera is the player, so the player is the origin of the scene
+The camera direction is the direction of the player's head
+
+So, if you're at coordinates (50, 62, 50)
+and there is a player2 near you who is at coordinates (100, 62, 100)
+For the scene, since you are the origin of the scene, player2 is at coordinates (50, 0, 50)
+
+The player model consists of 72 polygons, each polygon consists of 4 vertices, each vertex is 3 primitive values that mean coordinates of the vertex, usually it's float - 4 bytes, or double - 8 bytes.
+
+So, we have 864 values representing the coordinates of the vertices of the polygons of the model. In order to render it at certain coordinates, we must logically to add a coordinate (x, y, z) to each of the 288 vertices.
+
+It would look like this:
+
+```cs
+void render(float* vertices, int verticesCount, float x, float y, float z)
+{
+    glBegin(Mode.Polygon);
+    
+    vertices = modelToWorldCoordinates(vertices, verticesCount, x, y, z);
+    
+    for (vertexIndex = 0; vertexIndex < verticesCount; vertexIndex++)
+    {
+        vertex = vertices + vertexIndex * 3;
+	    glVertex3f(vertex[0], vertex[1], vertex[2]);
+    }
+    
+    glEnd();
+}
+
+float* modelToWorldCoordinates(float* vertices, int verticesCount, float x, float y, float z)
+{
+    worldVertices = alloc float[verticesCount * 3];
+    for (vertexIndex = 0; vertexIndex < verticesCount; vertexIndex++)
+    {
+        vertex = vertices + vertexIndex;
+        worldVertex = worldVertices + vertexIndex * 3;
+	
+        worldVertex[0] = vertex[0] + x;
+        worldVertex[1] = vertex[1] + y;
+        worldVertex[2] = vertex[2] + z;
+    }
+	
+    return worldVertices;
+}
+
+// This is a simplified version, there are no Vertex3f calls in the game entity model render itself
+```
+
+As we can see, we need the modelToWorldCoordinates function, which is difficult for the CPU to calculate because it sums float values. To make life easier for the programmer, there is a function called glTranslate. In simple words, it moves the origin by a certain shift, there can be several of them, and then their action is summarized.
+
+Let's rewrite the code using:
+```cs
+void render(float* vertices, int verticesCount, float x, float y, float z)
+{
+    glTranslatef(x, y, z);
+    glBegin(Mode.Polygon);
+	
+    for (vertexIndex = 0; vertexIndex < verticesCount; vertexIndex++)
+    {
+        vertex = vertices + vertexIndex * 3;
+	    glVertex3f(vertex[0], vertex[1], vertex[2]);
+    }
+    
+    glEnd();
+    glTranslatef(-x, -y, -z); // return origin to (0, 0, 0)
+}
+```
+
+Cool, now we have the model rendered at specific coordinates. 
+Let's make it harder: 
+The player has a rotation angle. But does his whole body rotate? — No. 
+This means that the model has to be divided into boxes. Each box has its own offset from the center of the model and its own angle.
+We can find the coordinates for a vertex using the simple math functions sin and cos. But just like moving the origin, OpenGL has a glRotate function for rotation. 
+
+Let's visualize the render function as something a little more complex:
+```cs
+class Box
+{
+    float XOffset, YOffset, ZOffset;
+    float* Vertices;
+    int VerticesCount;
+}
+
+class PlayerModel
+{
+    Box Head, Body, …;
+}
+
+void render(PlayerModel model, float x, float y, float z, float rotateX, float rotateY, float rotateZ)
+{
+    glTranslatef(x, y, z);
+	
+    render(model.Head, rotateX, rotateY, rotateZ);
+    render(model.Body, /*Convert head rotations into body rotations*/);
+    …
+    
+	glTranslatef(-x, -y, -z); // return origin to (0, 0, 0)
+}
+
+void render(Box box, float rotateX, float rotateY, float rotateZ)
+{
+    rotate(rotateX, rotateY, rotateZ);
+    glTranslatef(box.XOffset, box.YOffset, box.ZOffset);
+    glBegin(Mode.Polygon);
+	
+    for (vertexIndex = 0; vertexIndex < box.VerticesCount; vertexIndex++)
+    {
+        vertex = box.Vertices + vertexIndex * 3;
+        glVertex3f(vertex[0], vertex[1], vertex[2]);
+    }
+	
+    glEnd();
+    glTranslatef(-box.XOffset, -box.YOffset, -box.ZOffset);
+    rotate(-rotateX, -rotateY, -rotateZ);
+}
+
+void rotate(float x, float y, float z)
+{
+    if (x is not 0)
+        glRotatef(x, 1, 0, 0);
+    if (y is not 0)
+        glRotatef(y, 0, 1, 0);
+    if (z is not 0)
+        glRotatef(z, 0, 0, 1);
+}
+```
+
+As you can see, we have to reset the camera data to its original values after rendering each body part. 
+Wouldn't it be nice to save the initial camera position and then return it with a single call? The programmers thought about it, so meet glPushMatrix and glPopMatrix. 
+I want to kill myself for explaining everything in a simplistic way, I want to write another 2k about on how matrices work. But dear [DATA DELETED], let's imagine that glPushMatrix stores the current camera data in a queue, and glPopMatrix takes the last data of this queue and uses it as new camera data. 
+
+Let's rewrite a part of the code using:
+```cs
+void render(PlayerModel model, float x, float y, float z, float rotateX, float rotateY, float rotateZ)
+{
+    glPushMatrix();
+    glTranslatef(x, y, z);
+    glBegin(Mode.Polygon);
+	
+    render(model.Head, rotateX, rotateY, rotateZ);
+    render(model.Body, /*Convert head rotations into body rotations*/);
+    ...
+	
+    glEnd();
+    glPopMatrix();
+}
+
+void render(Box box, float rotateX, float rotateY, float rotateZ)
+{
+    glPushMatrix();
+    rotate(rotateX, rotateY, rotateZ);
+    glTranslatef(box.XOffset, box.YOffset, box.ZOffset);
+	
+    for (vertexIndex = 0; vertexIndex < box.VerticesCount; vertexIndex++)
+    {
+        vertex = box.Vertices + vertexIndex * 3;
+        glVertex3f(vertex[0], vertex[1], vertex[2]);
+    }
+	
+    glPopMatrix();
+}
+```
+
+Cool, now the code looks cleaner now.
+But we forgot something... the player can be a child, jump, crouch, swim, float, take damage, ride, etc. All of these actions are handled by model settings that end up using glRotate, glTranslate and glScale during rendering.
+
+These examples were not about glScale, let's write some code to our old code to add the ability for the player to be a child:
+```cs
+void render(float* vertices, int verticesCount, bool isChild, float x, float y, float z)
+{
+	glPushMatrix();
+	
+	if (isChild)
+		glScale(.5, .5, .5);
+	
+    glTranslatef(x, y, z);    
+    glBegin(Mode.Polygon);
+	
+    for (vertexIndex = 0; vertexIndex < verticesCount; vertexIndex++)
+    {
+        vertex = vertices + vertexIndex * 3;
+	    glVertex3f(vertex[0], vertex[1], vertex[2]);
+    }
+    
+    glEnd();
+	glPopMatrix();
+}
+```
+
+glScale is a very straightforward function that resizes the rendered "object" by scaling the vertex spacing.
+###
+
+Let's go back to Minecraft. Entity and tile blocks are rendered exactly by the functions described above. So, here is a pseudocode example of a chest rendering:
+```cs
+void renderChest(int worldX, int worldY, int worldZ)
+{
+    player = …;
+
+    x = worldX - player.X;
+    y = worldY - player.Y;
+    z = worldZ - player.Z;
+
+    glPushMatrix();
+    glTranslate(x, y, z);
+
+    glTranslatef(.0625, .4375, .9375);
+    renderChestModel();
+    glTranslatef(-.0625, -.4375, -.9375);
+
+    glTranslatef(.5, .4375, .9375);
+    renderChestKnobModel();
+    glTranslatef(-.5, -.4375, -.9375);
+
+    glTranslatef(.0625, .375, .0625);
+    renderChestBelowModel();
+    glTranslatef(-.0625, -.375, -.0625);
+
+    glPopMatrix();
+}
+
+void renderChestModel() { … }
+void renderChestKnobModel() { … }
+void renderChestBelowModel() { … }
+```
+
+This example does not use glPushMatrix between renderers. Why not? Do I look like a Minecraft developer? no lol, maybe it's just too expensive for a single glTranslate call.
+##
+## Creating Cheat
+
+So, the way to create cheats based on OpenGL hooks is to hook OpenGL methods, and within them find out what stage the renderer is in. And if the stage we need to get data, such as the coordinates of the entity, which is now being drawn, or supplement that data by drawing lines around it, which, unlike its texture, will be visible through the walls.
+
+We will hook in a few functions:
+1. glTranslatef (glTranslated is not used in 1.12.2)
+2. glScalef (glScaled is not used in 1.12.2)
+3. glOrtho
+
+You can also hook glSwapBuffers to understand when the frame is over.
+And also glEnable and glDisable, to disable the application of some attributes. For example, fog or shadows. I'll only touch on the functions needed for the ESP.
+
+Here are their signatures:
+1. void glTranslatef(float x, float y, float z)
+2. void glScalef(float x, float y, float z)
+3. void glOrtho(double left, double right, double bottom, double top, double zNear, double zFar)
+
+If it's clear with glTranslatef and glScalef, it's not clear with glOrtho.
+glOrtho specifies how to handle the coordinates sent to the renderer. In fact, it is what we call a 2D renderer, but as a normal space it has a 3rd coordinate but no perspective, which is very important.
+Documentation description: glOrtho describes a transformation that produces a parallel projection. The current matrix (see glMatrixMode) is multiplied by this matrix and the result replaces the current matrix, as if glMultMatrix was called with the following matrix as its argument :nerd:
+
+When glOrtho is called - the rendering of the 3D part is finished (of course, it could theoretically continue, but in Minecraft the 3D part is rendered first, and then the 2D part). This is the most convenient time in the whole render cycle to render something.
+
+By the way. If you need OBS bypass, use it for rendering instead of rendering in glOrtho render in glSwapBuffers, but then you will be available only have 2D rendering available.
+
+Therefore, we will hook glOrtho and draw all the necessary objects before running original function:
+```cs
+void hkglOrtho(double left, double right, double bottom, double top, double zNear, double zFar)
+{
+	renderESP();
+	glOrtho(left, right, bottom, top, zNear, zFar);
+}
+
+void renderESP() { … }
+```
+
+In the renderer, we will draw boxes that will be visible through the wall.
+
+AND It is worth talking about how we can save the coordinates of an object in order to draw the box at the coordinates of the object.
+Remember how we moved the coordinates of our scene? Well, they are stored in the so-called "modelview" matrix (you don't need to know what it is, it's just the current camera state data such as coordinates, angle, etc.). It can be saved and loaded.
+There are two ways to render something in an object's coordinates. As we remember, when we intercept the rendering of an object, the camera is in the center of that object or near it at a distance of a certain constant. So, we can:
+1. Save the coordinates obtained from the current model view matrix. Create a new matrices and perform a shift using the saved coordinates and other data, if it's necessary for rendering.
+2. Save the current projection and modelview matrix and load it at the moment of rendering the box.
+1-th: the coordinates are 3 float values - 12 bytes, NOT INCLUDING ROTATE ANGLE. 
+2-th: two matrices are 32 bytes. This method looks simpler and also save the angle of the camera.
+
+So I'll show you the second option.
+Create structures for typing render objects, and structures for storing data about render objects:
+```cs
+class RenderObject
+{
+	constructor()
+	{
+		glGetFloatv(PName.ProjectionMatrix, &ProjectionMatrix);
+		glGetFloatv(PName.ModelviewMatrix, &ModelViewMatrix);
+	} 
+	
+	float[] ProjectionMatrix;
+	float[] ModelViewMatrix;
+}
+
+class RenderTarget
+{
+	List<RenderObject> Objects;
+	AABB Box;
+	Vec3f Offset;
+}
+
+class Vec3f
+{
+	float X, Y, Z;
+}
+
+class AABB 
+{
+	float MinX, MinY, MinZ, MaxX, MaxY, MaxZ;
+}
+```
+
+Create render method:
+```cs
+ChestTarget = new RenderTarget
+{
+	Box = (.0625, .0625, .5, .9375, .9375, 1.375),
+	Offset = (0, .0625, .4375)
+};
+
+LargeChestTarget = new RenderTarget 
+{
+	Box = (.0625, .0625, .5, 1.9375, .9375, 1.375),
+	Offset = (0, .0625, -.4375)
+}
+
+PlayerTarget = new RenderTarget 
+{
+	Box = (-.3, 1, -.3, .3, -.8, .3),
+	Offset = (0, -1, 0)
+}
+
+TargetsToRender = [ChestTarget, DoubleChestTarget, PlayerTarget];
+void renderESP()
+{
+	foreach (target in TargetsToRender)
+	{
+		foreach (object in target.Objects)
+		{
+			// Load Matrices
+			glMatrixMode(Matrix.Projection);
+			glLoadMatrix(object.ProjectionMatrix);
+			
+			glMatrixMode(Matrix.Modelview);
+			glLoadMatrix(object.ModelviewMatrix);
+			
+			// Setup attributes
+			glPushAttrib(0x000fffff);
+			glPushMatrix();
+			glDisable(Cap.Texture2D);
+			glDisable(Cap.CullFace);
+			glDisable(Cap.Lighting);
+			glDisable(Cap.DepthTest);			
+			glEnable(Cap.LineSmooth);			
+			glEnable(Cap.Blend);
+			glBlendFunc(Factor.SrcAlpha, Factor.OneMinusSrcAlpha);
+			
+			// Do a offset from the model
+			glTranslate(target.XOffset, target.YOffset, target.ZOffset);
+			
+			// Render
+			renderBox(target.Box);
+			
+			// Return attributes back
+			glPopAttrib();
+			glPopMatrix();
+		}
+	}
+	ObjectsToRender.clear();
+}
+
+void renderBox(AABB aabb)
+{
+	glBegin(Mode.Lines);
+	
+	glVertex3f(bb.MinX, bb.MinY, bb.MinZ);
+	glVertex3f(bb.MaxX, bb.MinY, bb.MinZ);	
+	… // glVertex3f for all other vertices of the box
+	glVertex3f(bb.MinX, bb.MaxY, bb.MaxZ);
+    glVertex3f(bb.MinX, bb.MaxY, bb.MinZ);
+	
+	glEnd();
+}
+```
+
+All that's left is to add object rendering detection.
+Back to the hooked functions, let's add to hkglOrtho: hkglTranslatef and hkglScalef:
+```cs
+void hkglTrasnlatef(float x, float y, float z)
+{
+	glTrasnlatef(x, y, z);
+	
+	if (x is ? and y is ? and z is ?)
+		ChestTarget.Objects.Add(new RenderObject());
+	else if (x is ? and y is ? and z is ?)
+		LargeChestTarget.Objects.Add(new RenderObject());
+}
+
+void hkglScalef(float x, float y, float z)
+{
+	glScalef(x, y, z);
+	
+	if (x is ? and y is ? and z is ?)
+		PlayerTarget.Objects.Add(new RenderObject());
+}
+```
+
+But how do you understand which values of the function's arguments mean that a particular model will now be rendered?
+— There are a few ways:
+1. You can use the render API debugging software I described in the second post() :)
+2. TAKE x64dbg IN YOUR HANDS AND DO IT, LIKE YOUR FATHER DID WITH OllyDbg.
+3. Write a filter for rendering box for certain values, change the certain values in the game via e.g console.
+4. Open the source code of Minecraft and look at the rendering system and find some unique values
+
+You can choose any option you like. I'm going with option 3. Because I wrote ESP for protected clients that have debugger protection, custom client or need to use ESP for some other custom elements, and I needed to see on the monitor which elements have what values and whether these values are not used in the rendering of other elements.
+
+So, let's say you found the values by poking around the values used in the render:
+Chest: (.5, .4375, .9375)
+Large chest: (1, .4375, .9375)
+Player: (.9375, .9375, .9375)
+
+Now substituting these values we got:
+
+```cs
+void hkglTrasnlatef(float x, float y, float z)
+{
+	glTrasnlatef(x, y, z);
+	
+	if (x is .5 and y is .4375 and z is .9375)
+		ChestTarget.Objects.Add(new RenderObject());
+	else if (x is 1 and y is .4375 and z is .9375)
+		LargeChestTarget.Objects.Add(new RenderObject());
+}
+
+void hkglScalef(float x, float y, float z)
+{
+	glScalef(x, y, z);
+	
+	if (x is .9375 and y is .9375 and z is .9375)
+		PlayerTarget.Objects.Add(new RenderObject());
+}
+```
+
+There goes our ESP! 
+![[Pasted image 20240722135947.png]]
+![[Pasted image 20240722140337.png]]
+
+You can find an ESP written in C# here (link to the forum topic). It works for versions 1.0.0 - 1.16.5. Also you can find a repository from "aurenex" written in C++, which has less code and is easier to understand, if you know C++. But I highly recommend to be proud for C# and write in C#

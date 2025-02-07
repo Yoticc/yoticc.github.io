@@ -1,0 +1,340 @@
+
+## Nsight
+
+Now a little bit about Nsight Graphics software.
+It's a rendering API debugger that supports several rendering APIs, including OpenGL, with this program you can make a fingerprint of all called OpenGL functions, see buffer data, shader code, etc:
+![[Pasted image 20240722135106.png]]
+I described this program in detail in the second post().
+
+
+P.S.
+I discovered this information more than 3 years ago, with the help of August Vishnevsky, so now it seems to me that this information is simple and somehow clear, from the beginning, without detailed explanations, with a light explanation. But remembering myself and asking my programmer friends now, I realized that they have no idea how rendering works in a game. I tried to make the information as clear as possible for a person who has just started programming, and maybe even with this information he himself cannot make ESP himself, but he is just interested in how ESP works for Minecraft via OpenGL hooks.
+
+
+(NOT POWERED BY CHATGPT)
+
+
+# Introduction in Nsight Graphics. Creating ESP for Minecraft 1.15-1.21
+
+## Introduction
+Nsight Graphics - Render API Debugger, supports various rendering APIs, including OpenGL, with this program you can make a fingerprint of all called OpenGL functions, see buffer data, shader code etc:
+![[Pasted image 20240722135106.png]]
+
+In this post I will show you how to write an ESP for Minecraft 1.15-1.16.5 using the example of reversing the rendering algorithm. The source code can be found here(). Here I will show the parts and the algorithm I came up with using Nsight Graphics.
+
+The program allows you to attach a process or run it with the debugger enabled.
+It can be downloaded from the official website. It is completely free of charge.
+## Your first project
+Let's create a project with our version of Minecraft:
+1. Click **File->New Project**
+2. Enter the project name and check "**Create Directory**"
+In the next window we have to fill in the process start info. Launch Minecraft 1.15, Start Process Hacker and open the process of our game java.exe or javaw.exe:
+And paste the information from Process Hacker into Nsight Graphics fields:
+![[Untitled.png]]
+Important: Copy only thee command line arguments, do not copy the path to the executable file in the Process Command Line field
+
+Click **Launch Frame Debugger**
+The game should start with Nsight overlay. Now we can do a frame capture on key bind **F11**
+
+Let's do the first frame capture, so I'll go into the world and press **F11**:
+![[Pasted image 20240722151935.png]]
+
+A new window will open with the Render Timeline. Here we can see where the player model was rendered in the frame and where the chest rendered.
+
+Event 181
+![[Pasted image 20240722152825.png]]
+![[Pasted image 20240722153351.png]]
+
+Event 296
+![[Pasted image 20240722152840.png]]
+![[Pasted image 20240722153435.png]]
+
+We can see that the rendering was very similar.
+Here are the important things:
+1. glScalef(1/15, 1/15, 1/15) was used
+2. For the polygon rendering glDrawArrays(Mode.Quads) was used
+
+### Determine rendering object
+We'll come back to the first one later. This will help us to determine the object that will be rendered. 
+
+Let's understand how **glDrawArrays** works using the example of the piece **160-181**:
+```cs 
+glDrawArrays(Mode.Quads, 0, 288);
+```
+The arguments:
+1. Specifies the type of renderer that will render the primitives
+2. Specifies the start index of the vertices in the buffer
+3. Specifies the count of vertices to draw from the buffer
+
+The buffer is an array of data that is passed to the GPU during rendering. It can be created by various functions, here it is created not explicitly created during the transfer of the pointer to the data array in RAM. It can be understood by **glVertexPointer** functions, because there the address is passed to the "pointer" argument instead of the offset. If there is an offset there, the buffer bind function must be called before calling **glVertexPointer**.
+
+So let's hook the **glDrawArray** function and set a filter on the rendering:
+```cs
+void hkglDrawArrays(Mode mode, int first, int count)
+{
+    if ((mode, first, count) is (Mode.Quads, 0, 288))
+		// Render here own stuff
+}
+```
+
+#### About Vertex
+But what do we do? How to render the box by vertex coordinates in buffer and how is to get buffer?
+
+Let's look at to the functions above 181.
+We see the functions **glVertexPointer**, **glColorPointer**, **glTexCoordPointer** and **glNormalPointer**:
+![[Pasted image 20240722153351 1.png]]
+
+Each function has the same arguments (size, type, stride, pointer) and performs the same similar function of setting the position data in the vertex data buffer. 
+
+It transmits position data:
+1. Via **glVertexPointer** the vertex coordinates
+2. Via **glColorPointer** the vertex color
+3. Via **glTexCoordPointer** the texture coordinates of the vertex
+4. Via **glNormalPointer** the normals of the vertex
+
+The arguments specify the type and number of values for each property. 
+
+Each vertex has its own data and to map it to each vertex there is a vertex structure. 
+Everywhere the stride is 36, according to the documentation, stride is the indentation before the next data, if the value is 0, it is assumed that the coordinate data is stored in a row.
+So, if the indentation is 36, the size of the vertex structure will also be 36.
+With gl "pointer" function calls the structure of the vertex can be recreated.
+
+This is what the buffer in memory looks like:
+![[Untitled 1.png]]
+
+So the structure of the vertex will be:
+```cs
+unsafe struct Vertex
+{
+    public fixed float Position[3];
+    public fixed byte Color[4];
+    public fixed float TexCoord1[2];
+    public fixed short TexCoord2[2];
+    public fixed short TexCoord3[2];
+    public fixed byte Normal[4];
+} // sizeof(Vertex) == 36
+```
+
+#### About Buffer
+Since **glVertexPointer** is called once before the **glDrawArray** render functions, we can hook **glVertexPointer**, and store its buffer in a variable to use in the hooked **glDrawArrays**. We will save the buffer immediately as Vertex*:
+```cs
+Vertex* lastBuffer;
+void VertexPointer(int size, TexType type, int stride, void* pointer)
+{
+	if ((size, type, stride) is (3, TexType.Float, 36))
+		lastBuffer = (Vertex*)pointer;
+}
+```
+
+What remains to be figured out is how to convert vertices are converted into quads.
+In OpenGL there are different **Mode**s at the renderer, **Quad** means that each quad uses 4 vertices that are not reused. For example, in **StripLine** mode, if 4 vertices are used, 3 lines will be rendered, while in **Line** mode, 2 lines will be rendered. This is because the vertices are not reused.
+So we have 288 vertices, they point to quad vertices by order, so the number of quads will be 288 / 4 = **72**.
+
+So, structure of Quad is:
+```cs
+record struct Quad(Vertex A, Vertex B, Vertex C, Vertex D);
+```
+
+Suppose we want to show through the wall silhouette of the player through the blocks, then we cannot pass the existing buffer in the new **glDrawArray** function, we need to either create a new buffer and use **glDrawArray** to render outlined quads, or take data from the buffer and individually draw each individual **Quad** using **StripLine**.
+
+In case, if the minecraft doesn't use shaders (in version 1.17 they are used), then the second way can be used:
+```cs
+void DrawArrays(Mode mode, int first, int count)
+{
+    if ((mode, first, count) is not (Mode.Quads, 0, 288))
+        return;
+	
+    Push();
+    GL.LoadIdentity();
+    GL.LineWidth(1);
+	GL.Color(.1, .8, .7, .75);
+	
+    var quads = (Quad*)lastBuffer;
+    var quadsCount = count / 4;
+    for (var quadIndex = 0; quadIndex < quadsCount; quadIndex++)
+    {
+        var quad = quads + quadIndex;
+        DrawOutlined(quad);
+    }
+	
+    Pop();
+	
+    void DrawOutlined(Quad* quad)
+    {
+        GL.Begin(Mode.LineLoop);
+        Vertex(quad->A);
+        Vertex(quad->B);
+        Vertex(quad->C);
+        Vertex(quad->D);
+        Vertex(quad->A);
+        GL.End();
+    }
+	
+    void Vertex(Vertex vertex) => GL.Vertex3(vertex.Position);
+}
+```
+
+Build and test:
+![[Pasted image 20240803150014.png]]
+— Successful
+
+But there is a problem — the calculation of the rendering of the player is based on the number of vertices. The player model can have the same number of vertices as other models. I found that there's a match for the bed and the horses:
+![[Pasted image 20240803155745.png]]
+![[Pasted image 20240803155732.png]]
+
+To solve this, can we can use a filter on the last applied scale, as we remember before calling **glDrawArrays** was called **glScalef(1/15, 1/15, 1/15)**.
+
+Remember last called scaleF value:
+```cs
+Vec3F lastScaleF;
+void ScaleF(Vec3F vec) => lastScaleF = vec;
+```
+where **Vec3F** is **(float, float, float)**:
+```cs
+using Vec3F = (float, float, float);
+```
+
+And apply filter for it:
+```cs
+void DrawArrays(Mode mode, int first, int count)
+{
+    if (lastScaleF is not (1f / 15, 1f / 15, 1f / 15))
+        return;
+	
+    if ((mode, first, count) is not (Mode.Quads, 0, 288))
+        return;
+    
+	…
+}
+```
+
+It might have helped with some of the models. But most of the entities are rendered using glScale(1/15, 1/15, 1/15) and it didn't work in this case.
+So other data has to be used. Don't forget that we have other data along with the coordinates in **Vertex** we have other data. **Color** and **Normals** will not give us unique information, but **TexCoord** can.
+
+TexCoord is the coordinates on the texture surface that indicate the corners of the texture to be superimposed on the quad. 
+These can be **(ushort, ushort)** pixel coordinates or **(float, float)** coordinates from 0 to 1.
+Here is the answer about the texture coordinates:
+
+Texture coordinates specify the point in the texture image that will correspond to the vertex you are specifying them for. Think of a rectangular rubber sheet with your texture image printed on it, where the length of each side is normalized to the range 0-1. Now let's say you wanted to draw a triangle using that texture. You'd take 3 pins and place them in the rubber sheet in the positions of each of your desired texture coordinates. (Say [0, 0], [1, 0] and [1, 1]) then move those pins (without taking them out) to your desired vertex coordinates (Say [0, 0], [0.5, 0] and [1, 1]), so that the rubber sheet is stretched out and the image is distorted. That's basically how texture coordinates work.
+If you use texture coordinates greater than 1 and your texture is set to repeat, then it's as if the rubber sheet was infinite in size and the texture was tiled across it. Therefore if your texture coordinates for two vertices were 0, 0 and 4, 0, then the image would have to be repeated 4 times between those vertices.
+![[Pasted image 20240803161055.png]]
+
+To analyze the texture, we get their textures via Nsight. To do this, I will go to the world with these objects and make a screenshot of the capture:
+![[Pasted image 20240811180820.png]]
+I'll use the beds as an example:
+![[Pasted image 20240811180842.png]]
+In the API Inspector window, select the Textures tab and locate the bed texture
+![[Pasted image 20240811180926.png]]
+I'll do it again with other objects and I'll get:
+Player:
+![[57__2_ (4) (1).png]]
+Bed:
+![[45.png]]
+Horse:
+![[73.png]]
+
+As you can see, although these models have the same the number of vertices, they have completely different texture coordinates and this can be used to define the model.
+Note that the same order of polygon rendering is not used when drawing the model.
+Therefore, to define the model, we will check the existence of certain coordinates of quad vertices, such as 2 or 3 of all quads.
+Texture coordinates can be viewed in the current texture view in Nsight. You can also view them in the buffer viewer. Or output them to the console using the cheat.
+
+I had selected some nice quads. I decided that it's enough to check only 2 polygons out of all of them to see for myself what kind of texture will be rendered. It's also worth mentioning that as you can see this on the models. Some models use different texture variations, like - bed: there are 16 variations in its texture, so if you want to do a check for the bed, you have to do a check for all 16 variations of the bed. I'll tell you up front — in our case it's going to be the chest texture.
+
+The polygons I chose for the player texture:
+```cs
+[
+	[
+	    [.96875, .8125],
+		[.921875, .8125],
+		[.921875, 1],
+		[.96875, 1]
+	],
+	[
+	    [.71875, .8125],
+		[.671875, .8125],
+		[.671875, 1],
+		[.96875, 1]
+	],
+]
+```
+
+Create a structure to store the data about predictable quad data and a utility class for the texture verifier:
+```cs
+unsafe record struct PredictVertex(float X, float Y)
+{
+    public bool IsSuitable(Vertex* vertex) => vertex->TexCoord1[0] == X && vertex->TexCoord1[1] == Y;
+
+    public static implicit operator PredictVertex((float X, float Y) args) => new(args.X, args.Y);
+}
+
+unsafe record struct PredictQuad(PredictVertex A, PredictVertex B, PredictVertex C, PredictVertex D)
+{
+    public bool IsSuitable(Quad* quad) => A.IsSuitable((Vertex*)quad) && B.IsSuitable((Vertex*)quad + 1) && B.IsSuitable((Vertex*)quad + 2) && D.IsSuitable((Vertex*)quad + 3);
+
+    public static implicit operator PredictQuad((PredictVertex A, PredictVertex B, PredictVertex C, PredictVertex D) args) => new(args.A, args.B, args.C, args.D);
+}
+```
+
+```cs
+unsafe record TexPredictate(params PredictQuad[] Quads)
+{
+    public bool IsSuitable(Quad* quads, int count)
+    {
+        if (Quads.Length > count)
+            return false;
+		
+        for (var predicateIndex = 0; predicateIndex < Quads.Length; predicateIndex++)
+        {
+            var found = false;
+            for (var quadIndex = 0; quadIndex < count; quadIndex++)
+                if (Quads[predicateIndex].IsSuitable(quads + quadIndex))
+                {
+                    found = true;
+                    break;  
+                }
+			
+            if (!found)
+                return false;
+        }
+		
+        return true;
+    }
+}
+```
+
+Now define the predicate for player texture:
+```cs
+static class TexPredicates
+{
+    public static TexPredicate Player = new(
+        ((.96875f, .8125f), (.921875f, .8125f), (.921875f, 1f), (.96875f, 1f)),
+        ((.71875f, .8125f), (.671875f, .8125f), (.671875f, 1f), (.71875f, 1f))
+    );
+}
+```
+
+Use this utility in the rendering code:
+```cs
+void DrawArrays(Mode mode, int first, int count)
+{
+    if (lastScaleF is not (1f / 15, 1f / 15, 1f / 15))
+        return;
+	
+    if ((mode, first, count) is not (Mode.Quads, 0, 288))
+        return;
+	
+    var quads = (Quad*)lastBuffer;
+    var quadsCount = count / 4;
+	
+    if (!TexPredicates.Player.IsSuitable(quads, quadsCount))
+        return;
+    
+	…
+}
+```
+
+Now ESP only detects players without errors, and indeed. This is the final version. The same code can be repeated with chests and the rest of the entities. There is a code for chest ESP on github. And also there are also some nice details that there is no point in telling you about here.
+
+There are tons of other features in Nsight, here are the basic ones needed to create an ESP for Minecraft.
+
+(NOT POWERED BY CHATGPT)
